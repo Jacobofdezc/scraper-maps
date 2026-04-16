@@ -1,39 +1,90 @@
-# pip install playwright pandas
-# playwright install chromium
-
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 import pandas as pd
-import time
+import asyncio
 import json
 import os
+import sys
+import subprocess
+import tempfile
 
-def scrape_google_maps(query: str, max_results: int = 50) -> list[dict]:
-    
+
+# ─── ACEPTAR TÉRMINOS ─────────────────────────────────────────────────────────
+
+async def aceptar_terminos_async(page):
+    try:
+        await page.wait_for_selector('button', timeout=10000)
+        textos_aceptar = [
+            "Aceptar todo", "Aceptar todos", "Accept all",
+            "Agree", "I agree", "Aceptar", "Accept",
+        ]
+        for texto in textos_aceptar:
+            boton = page.get_by_role("button", name=texto)
+            if await boton.is_visible():
+                await boton.click()
+                await asyncio.sleep(1)
+                return True
+        return False
+    except:
+        return False
+
+
+# ─── EXTRACCIÓN DE DATOS ──────────────────────────────────────────────────────
+
+async def extract_business_data_async(page) -> dict:
+    data = {}
+
+    async def safe_text(selector: str, attribute: str = None) -> str:
+        try:
+            el = page.locator(selector).first
+            if attribute:
+                return await el.get_attribute(attribute) or ""
+            return await el.inner_text() or ""
+        except:
+            return ""
+
+    data["nombre"]         = await safe_text('h1.DUwDvf')
+    data["categoria"]      = await safe_text('button.DkEaL')
+    data["direccion"]      = await safe_text('[data-item-id="address"] .Io6YTe')
+    data["telefono"]       = await safe_text('[data-item-id*="phone:tel"] .Io6YTe')
+    data["web"]            = await safe_text('[data-item-id="authority"] .Io6YTe')
+    data["rating"]         = await safe_text('div.F7nice span[aria-hidden="true"]')
+    data["num_reseñas"]    = (await safe_text('div.F7nice span[aria-label*="reseñas"]', "aria-label")).replace(" reseñas", "").strip()
+    data["estado_horario"] = await safe_text('div[jsaction*="openhours"] .ZDu9vd span span')
+    data["url_maps"]       = page.url
+
+    try:
+        url = page.url
+        if "@" in url:
+            coords = url.split("@")[1].split(",")
+            data["latitud"]  = coords[0]
+            data["longitud"] = coords[1]
+    except:
+        data["latitud"]  = ""
+        data["longitud"] = ""
+
+    return data if data.get("nombre") else None
+
+
+# ─── SCRAPER PRINCIPAL (ASYNC) ────────────────────────────────────────────────
+
+async def scrape_google_maps_async(query: str, max_results: int = 50) -> list[dict]:
     results = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
             locale="es-ES",
-            # Guardar las cookies entre ejecuciones para no tener que aceptar siempre
             storage_state="cookies.json" if os.path.exists("cookies.json") else None
         )
-        page = context.new_page()
+        page = await context.new_page()
 
         url = f"https://www.google.com/maps/search/{query.replace(' ', '+')}"
-        page.goto(url, wait_until="networkidle")
-        time.sleep(2)
+        await page.goto(url, wait_until="networkidle")
+        await asyncio.sleep(2)
 
-        # ── Aceptar términos automáticamente ──
-        aceptar_terminos(page)
+        await aceptar_terminos_async(page)
+        await context.storage_state(path="cookies.json")
 
-        # ── Guardar cookies para próximas ejecuciones ──
-        context.storage_state(path="cookies.json")
-        print("  ✓ Cookies guardadas para futuras ejecuciones")
-
-        # ... resto del código igual
-
-        # Scroll para cargar más resultados
         print(f"Cargando resultados para: {query}")
         scroll_panel = page.locator('div[role="feed"]')
 
@@ -41,8 +92,7 @@ def scrape_google_maps(query: str, max_results: int = 50) -> list[dict]:
         stale_scrolls = 0
 
         while len(results) < max_results and stale_scrolls < 5:
-            # Obtener todos los negocios visibles
-            listings = page.locator('a[href*="google.com/maps/place"]').all()
+            listings = await page.locator('a[href*="google.com/maps/place"]').all()
             current_count = len(listings)
 
             if current_count == previous_count:
@@ -52,181 +102,201 @@ def scrape_google_maps(query: str, max_results: int = 50) -> list[dict]:
                 previous_count = current_count
 
             print(f"  → {current_count} negocios encontrados...")
+            await scroll_panel.evaluate("el => el.scrollBy(0, 1000)")
+            await asyncio.sleep(1.5)
 
-            # Hacer scroll en el panel lateral
-            scroll_panel.evaluate("el => el.scrollBy(0, 1000)")
-            time.sleep(1.5)
-
-        # Procesar cada negocio
-        listings = page.locator('a[href*="google.com/maps/place"]').all()
+        listings = await page.locator('a[href*="google.com/maps/place"]').all()
         print(f"\nExtrayendo datos de {min(len(listings), max_results)} negocios...")
 
         for i, listing in enumerate(listings[:max_results]):
             try:
-                listing.click()
-                time.sleep(2)
-
-                data = extract_business_data(page)
+                await listing.click()
+                await asyncio.sleep(2)
+                data = await extract_business_data_async(page)
                 if data:
                     results.append(data)
                     print(f"  [{i+1}] {data.get('nombre', 'Sin nombre')}")
-
             except Exception as e:
                 print(f"  Error en negocio {i+1}: {e}")
                 continue
 
-        browser.close()
+        await browser.close()
 
     return results
 
-def aceptar_terminos(page):
-    """Acepta automáticamente los términos y cookies de Google Maps."""
-    
-    try:
-        # Espera hasta 10 segundos a que aparezca algún botón de aceptar
-        page.wait_for_selector('button', timeout=10000)
-        
-        # Lista de textos posibles del botón (Google los cambia según idioma y versión)
-        textos_aceptar = [
-            "Aceptar todo",
-            "Aceptar todos",
-            "Accept all",
-            "Agree",
-            "I agree",
-            "Aceptar",
-            "Accept",
-            "Rechazar todo",  # A veces hay que hacer clic en rechazar para cerrar
-        ]
-        
-        for texto in textos_aceptar:
-            boton = page.get_by_role("button", name=texto)
-            if boton.is_visible():
-                boton.click()
-                print(f"  ✓ Banner aceptado automáticamente ({texto})")
-                time.sleep(1)
-                return True
-        
-        print("  → No se encontró banner de términos, continuando...")
-        return False
-        
-    except Exception as e:
-        print(f"  → Sin banner de términos: {e}")
-        return False
 
-def extract_business_data(page) -> dict:
-    """Extrae todos los datos del negocio actualmente abierto."""
+# ─── SCRAPER COMPATIBLE CON STREAMLIT EN WINDOWS ──────────────────────────────
 
-    data = {}
+def scrape_google_maps(query: str, max_results: int = 50) -> list[dict]:
+    """Lanza el scraper en un proceso Python completamente separado.
+    Soluciona el conflicto entre Playwright y Streamlit en Windows."""
 
-    def safe_text(selector: str, attribute: str = None) -> str:
+    script = f"""
+import asyncio
+import json
+import os
+import sys
+
+async def main():
+    from playwright.async_api import async_playwright
+    results = []
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(locale="es-ES")
+        page = await context.new_page()
+
+        url = "https://www.google.com/maps/search/{query.replace(' ', '+')}"
+        await page.goto(url, wait_until="networkidle")
+        await asyncio.sleep(2)
+
         try:
-            el = page.locator(selector).first
-            if attribute:
-                return el.get_attribute(attribute) or ""
-            return el.inner_text() or ""
+            for texto in ["Aceptar todo", "Aceptar todos", "Accept all", "Aceptar"]:
+                boton = page.get_by_role("button", name=texto)
+                if await boton.is_visible():
+                    await boton.click()
+                    await asyncio.sleep(1)
+                    break
         except:
-            return ""
+            pass
 
-    # Nombre
-    data["nombre"] = safe_text('h1.DUwDvf')
+        scroll_panel = page.locator('div[role="feed"]')
+        previous_count = 0
+        stale_scrolls = 0
 
-    # Categoría
-    data["categoria"] = safe_text('button.DkEaL')
+        while len(results) < {max_results} and stale_scrolls < 5:
+            listings = await page.locator('a[href*="google.com/maps/place"]').all()
+            current_count = len(listings)
+            if current_count == previous_count:
+                stale_scrolls += 1
+            else:
+                stale_scrolls = 0
+                previous_count = current_count
+            await scroll_panel.evaluate("el => el.scrollBy(0, 1000)")
+            await asyncio.sleep(1.5)
 
-    # Dirección
-    data["direccion"] = safe_text('[data-item-id="address"] .Io6YTe')
+        listings = await page.locator('a[href*="google.com/maps/place"]').all()
 
-    # Teléfono
-    data["telefono"] = safe_text('[data-item-id*="phone:tel"] .Io6YTe')
+        for listing in listings[:{max_results}]:
+            try:
+                await listing.click()
+                await asyncio.sleep(2)
 
-    # Sitio web
-    data["web"] = safe_text('[data-item-id="authority"] .Io6YTe')
+                async def safe(sel, attr=None):
+                    try:
+                        el = page.locator(sel).first
+                        if attr:
+                            return await el.get_attribute(attr) or ""
+                        return await el.inner_text() or ""
+                    except:
+                        return ""
 
-    # Rating (puntuación)
-    data["rating"] = safe_text('div.F7nice span[aria-hidden="true"]')
+                data = {{
+                    "nombre":         await safe("h1.DUwDvf"),
+                    "categoria":      await safe("button.DkEaL"),
+                    "direccion":      await safe('[data-item-id="address"] .Io6YTe'),
+                    "telefono":       await safe('[data-item-id*="phone:tel"] .Io6YTe'),
+                    "web":            await safe('[data-item-id="authority"] .Io6YTe'),
+                    "rating":         await safe('div.F7nice span[aria-hidden="true"]'),
+                    "num_reseñas":    (await safe('div.F7nice span[aria-label*="reseñas"]', "aria-label")).replace(" reseñas", "").strip(),
+                    "estado_horario": await safe('div[jsaction*="openhours"] .ZDu9vd span span'),
+                    "url_maps":       page.url,
+                }}
 
-    # Número de reseñas
-    reseñas_raw = safe_text('div.F7nice span[aria-label*="reseñas"]', "aria-label")
-    data["num_reseñas"] = reseñas_raw.replace(" reseñas", "").replace(",", "").strip()
+                try:
+                    if "@" in page.url:
+                        coords = page.url.split("@")[1].split(",")
+                        data["latitud"]  = coords[0]
+                        data["longitud"] = coords[1]
+                except:
+                    data["latitud"]  = ""
+                    data["longitud"] = ""
 
-    # Horario (si está abierto / horas)
-    data["estado_horario"] = safe_text('div[jsaction*="openhours"] .ZDu9vd span span')
+                if data.get("nombre"):
+                    results.append(data)
 
-    # URL de Google Maps
-    data["url_maps"] = page.url
+            except:
+                continue
 
-    # Coordenadas (extraídas de la URL)
+        await browser.close()
+
+    print(json.dumps(results, ensure_ascii=False))
+
+asyncio.run(main())
+"""
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py',
+                                     delete=False, encoding='utf-8') as f:
+        f.write(script)
+        tmp_path = f.name
+
     try:
-        url = page.url
-        if "@" in url:
-            coords = url.split("@")[1].split(",")
-            data["latitud"] = coords[0]
-            data["longitud"] = coords[1]
-    except:
-        data["latitud"] = ""
-        data["longitud"] = ""
+        result = subprocess.run(
+            [sys.executable, tmp_path],
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            timeout=300
+        )
 
-    return data if data.get("nombre") else None
+        if result.returncode != 0:
+            print(f"Error en subproceso:\n{result.stderr}")
+            return []
 
+        output = result.stdout.strip()
+        if output:
+            return json.loads(output)
+        return []
+
+    except subprocess.TimeoutExpired:
+        print("Timeout: el scraper tardó demasiado")
+        return []
+    except Exception as e:
+        print(f"Error inesperado: {e}")
+        return []
+    finally:
+        os.unlink(tmp_path)
+
+
+# ─── EXPORTAR RESULTADOS ──────────────────────────────────────────────────────
 
 def exportar_resultados(data: list[dict], nombre_archivo: str = "negocios"):
-    """Exporta los resultados a CSV y JSON, con filtro de negocios sin web."""
-
     if not data:
         print("No hay datos para exportar.")
         return
 
     df = pd.DataFrame(data)
-
-    # Columna que marca si tiene web o no
     df["tiene_web"] = df["web"].apply(lambda x: "No" if str(x).strip() == "" else "Sí")
 
-    # CSV con todos los negocios
     df.to_csv(f"{nombre_archivo}.csv", index=False, encoding="utf-8-sig")
-    print(f"\n✓ CSV completo guardado: {nombre_archivo}.csv ({len(df)} negocios)")
+    print(f"\n✓ CSV completo: {nombre_archivo}.csv ({len(df)} negocios)")
 
-    # CSV solo con los que NO tienen web (tus clientes potenciales)
     sin_web = df[df["tiene_web"] == "No"]
     sin_web.to_csv(f"{nombre_archivo}_sin_web.csv", index=False, encoding="utf-8-sig")
-    print(f"✓ CSV sin web guardado: {nombre_archivo}_sin_web.csv ({len(sin_web)} negocios)")
+    print(f"✓ CSV sin web:  {nombre_archivo}_sin_web.csv ({len(sin_web)} negocios)")
 
-    # JSON
     with open(f"{nombre_archivo}.json", "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    print(f"✓ JSON guardado: {nombre_archivo}.json")
+    print(f"✓ JSON:         {nombre_archivo}.json")
 
-    # Resumen en terminal
     print(f"\n{'='*40}")
-    print(f"  Total negocios encontrados : {len(df)}")
-    print(f"  Con página web             : {len(df[df['tiene_web'] == 'Sí'])}")
-    print(f"  Sin página web (potencial) : {len(sin_web)}")
+    print(f"  Total negocios      : {len(df)}")
+    print(f"  Con web             : {len(df[df['tiene_web'] == 'Sí'])}")
+    print(f"  Sin web (potencial) : {len(sin_web)}")
     print(f"{'='*40}")
 
-    # Vista previa de los que no tienen web
-    if not sin_web.empty:
-        cols = ["nombre", "categoria", "telefono", "direccion"]
-        cols_disponibles = [c for c in cols if c in sin_web.columns]
-        print("\nNegocios sin web (primeros 5):")
-        print(sin_web[cols_disponibles].head(5).to_string(index=False))
 
-# ─── EJECUCIÓN ────────────────────────────────────────────────────────────────
-
-# ─── EJECUCIÓN ────────────────────────────────────────────────────────────────
+# ─── EJECUCIÓN DIRECTA ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    
-    # Lista todas las búsquedas que quieras aquí
+
     BUSQUEDAS = [
-        "clínicas dentales en Madrid",
-        "clínicas de medicina estética premium",
-        "centros de fisioterapia madrid",
-        "centros de estética avanzada con aparatología",
-        "centros de depilación láser en Madrid",
-        "clínicas veterinarias urbanas",
+        "restaurantes japoneses Madrid",
+        "peluquerías Barcelona centro",
     ]
-    
+
     MAX_RESULTADOS_POR_BUSQUEDA = 20
-    NOMBRE_ARCHIVO = "todos_los_negocios_Madrid"
+    NOMBRE_ARCHIVO = "todos_los_negocios"
 
     todos_los_resultados = []
 
@@ -234,19 +304,13 @@ if __name__ == "__main__":
         print(f"\n{'='*50}")
         print(f"Buscando: {busqueda}")
         print(f"{'='*50}")
-        
+
         negocios = scrape_google_maps(busqueda, MAX_RESULTADOS_POR_BUSQUEDA)
-        
-        # Añade la columna "busqueda" para saber de dónde viene cada resultado
+
         for negocio in negocios:
             negocio["busqueda"] = busqueda
-        
-        todos_los_resultados.extend(negocios)
-        print(f"✓ {len(negocios)} negocios añadidos (total acumulado: {len(todos_los_resultados)})")
-        
-        # Pausa entre búsquedas para no levantar sospechas
-        print("Esperando 5 segundos antes de la siguiente búsqueda...")
-        time.sleep(5)
 
-    # Exportar todo junto
-    exportar_resultados(todos_los_resultados, nombre_archivo=NOMBRE_ARCHIVO)
+        todos_los_resultados.extend(negocios)
+        print(f"✓ {len(negocios)} negocios añadidos (total: {len(todos_los_resultados)})")
+
+    exportar_resultados(todos_los_resultados, NOMBRE_ARCHIVO)
