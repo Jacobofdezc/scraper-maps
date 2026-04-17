@@ -34,6 +34,10 @@ if ejecutar and busquedas_input.strip():
         status.info(f"Buscando: {busqueda}...")
         negocios = scrape_google_maps(busqueda, max_resultados)
         
+        if not negocios:
+            status.warning(f"⚠️ Sin resultados para: '{busqueda}'. Revisa la consola para ver los logs.")
+            continue
+       
         for negocio in negocios:
             negocio["busqueda"] = busqueda
         
